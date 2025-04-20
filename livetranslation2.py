@@ -6,19 +6,27 @@ import numpy as np
 import speech_recognition as sr
 import whisper
 import torch
+import asyncio  # For asynchronous operations
 
 from datetime import datetime, timedelta
 from queue import Queue
 from time import sleep
 from sys import platform
 
-def main():
+async def process_audio_chunk(audio_data, audio_model):
+    """Processes a single audio chunk asynchronously."""
+    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    use_fp16 = torch.cuda.is_available()
+    result = await asyncio.to_thread(audio_model.transcribe, audio_np, fp16=use_fp16, beam_size=1, word_timestamps=True)
+    return result
+
+async def main():
     parser = argparse.ArgumentParser(
         description="Real-time mic transcription with SpeechRecognition + whisper, now word-by-word & faster."
     )
     parser.add_argument(
         "--model",
-        default="meduim",  # default to "tiny" for speed
+        default="base",  # default to "tiny" for speed
         choices=["tiny", "base", "small", "medium", "large"],
         help="Whisper model to use."
     )
@@ -91,15 +99,12 @@ def main():
     record_timeout = args.record_timeout
     phrase_timeout = args.phrase_timeout
 
-    # We'll store each chunk's recognized words in separate lines
-    # if there's a big pause
-    lines = []  # each item is a list of words
-    lines.append([])  # start with empty list of words
-
+    lines = []
+    lines.append([])
     phrase_time = None
     data_queue = Queue()
+    transcription_queue = asyncio.Queue()  # Queue for processed transcriptions
 
-    # Callback function when a chunk is done
     def record_callback(_, audio: sr.AudioData):
         data = audio.get_raw_data()
         data_queue.put(data)
@@ -109,73 +114,61 @@ def main():
         recorder.adjust_for_ambient_noise(source, duration=1)
         print("Calibration complete. Starting background listening...")
 
-    # Start background thread
     recorder.listen_in_background(
         source,
         record_callback,
         phrase_time_limit=record_timeout
     )
 
-
     print("Recording... Speak!\n")
 
-    while True:
-        try:
+    async def process_queue():
+        while True:
+            audio_data = await data_queue.get()
+            result = await process_audio_chunk(audio_data, audio_model)
+            await transcription_queue.put(result)
+            data_queue.task_done()
+
+    async def update_transcript():
+        nonlocal phrase_time, lines
+        while True:
+            result = await transcription_queue.get()
             now = datetime.utcnow()
-            if not data_queue.empty():
-                chunk_gap = False
-                if phrase_time and (now - phrase_time) > timedelta(seconds=phrase_timeout):
-                    chunk_gap = True
-                phrase_time = now
+            chunk_gap = False
+            if phrase_time and (now - phrase_time) > timedelta(seconds=phrase_timeout):
+                chunk_gap = True
+                lines.append([])
+            phrase_time = now
 
-                # Gather raw audio data
-                audio_data = b"".join(list(data_queue.queue))
-                data_queue.queue.clear()
+            segments = result["segments"]
+            for seg in segments:
+                for w in seg["words"]:
+                    word = w["word"]
+                    print(word, end=" ", flush=True)
+                    lines[-1].append(word)
+            transcription_queue.task_done()
 
-                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            os.system('cls' if os.name == 'nt' else 'clear')
+            for word_list in lines:
+                print(" ".join(word_list))
+            print("", end="", flush=True)
 
-                # Try GPU if available
-                use_fp16 = torch.cuda.is_available()
-                # Transcribe with word timestamps
-                result = audio_model.transcribe(
-                    audio_np,
-                    fp16=use_fp16,
-                    beam_size=1,          # faster
-                    word_timestamps=True  # key for word-by-word
-                )
+    # Start processing and updating tasks concurrently
+    processing_task = asyncio.create_task(process_queue())
+    updating_task = asyncio.create_task(update_transcript())
 
-                # If there's a big pause => new line of words
-                if chunk_gap:
-                    lines.append([])
-
-                # Extract each recognized word from segments
-                # and append to the last line in 'lines'
-                segments = result["segments"]
-                for seg in segments:
-                    for w in seg["words"]:
-                        word = w["word"]  # Adjust to the actual key in your data
-                        print(word, end=" ", flush=True)
-
-                        lines[-1].append(word)
-
-                # Clear screen & re-print everything word-by-word
-                os.system('cls' if os.name == 'nt' else 'clear')
-                for word_list in lines:
-                    # Join words with a space
-                    print(" ".join(word_list))
-                print("", end="", flush=True)
-
-            else:
-                # Avoid burning CPU in an infinite loop
-                sleep(0.25)
-
-        except KeyboardInterrupt:
-            break
+    try:
+        await asyncio.gather(processing_task, updating_task)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        processing_task.cancel()
+        updating_task.cancel()
+        await asyncio.gather(processing_task, updating_task, return_exceptions=True)
 
     print("\n\nFinal Transcript:")
     for i, word_list in enumerate(lines):
         print(f"Line {i+1}: {' '.join(word_list)}")
 
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
