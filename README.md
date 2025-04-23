@@ -1,5 +1,5 @@
 # Live-Transcription
-A live transcription service made for CSH's ImagineRIT 2025 project using WhisperAI.
+A live transcription service made for CSH's ImagineRIT 2025 project using WhisperAI. Now improved with threading for CPU usage.
 
 Hi everyone!
 
